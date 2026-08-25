@@ -562,3 +562,37 @@ try above to maintain contracts import goods
 
 consider using the above to detect water objects in the scanner
 
+
+
+---
+
+## silent failure: water access point detection
+
+`WaterPoints.Detect` (`mod_map_scanner_hl.lua`) logs `no water access points found, skipping area`
+and returns `{}` when an area yields zero water points. Nothing else notices. `Areas_WithWaterPoints`
+then drops the area from its return, so the planner simply never sees that island and no route is
+ever built for it.
+
+That is exactly how Enbesa stayed broken: every water tile classified as `not_accessible` because
+the probe was wrong, three islands silently skipped, no error anywhere. It was only found by reading
+the cache files by hand.
+
+An island with land but zero water is not a normal state -- a scanned area you cannot reach by ship
+is almost always a broken probe, bad bounds, or too coarse a scan step. Worth notifying the user
+rather than logging at the same level as everything else.
+
+Note `mod_map_scanner.lua` now has a measured per-region probe table; a region added without a row
+in it falls back to the Old/New World probe, which is precisely the case that fails this way.
+
+## reading a building's PRODUCT costs
+
+The `ToolOneHelper BuildCost(...) Costs Count` note at the end of this file is worth pursuing.
+`ts.BuildMode.Costs` is a `CBuildCost` and exposes only money and influence -- `Empty`,
+`MoneyCost`, `IsPayable`, `InfluenceCost`, `InfluenceUsageCost`, `InfluencePayback`,
+`InfluencePayable`, `HasInfluenceChanges` -- with no product list anywhere on it
+(`docs/lua-inspector/ts.BuildMode.yaml:10973-11003`).
+
+That is why identifying Enbesa's quay came down to matching a money value: the Wanza Timber half of
+its price is invisible from the Lua side. If the Serp text-source route does return product costs,
+it would identify a building by what it actually consumes rather than by a price collision, and
+would have settled `117729` vs `1010567` outright.

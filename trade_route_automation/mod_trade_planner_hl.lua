@@ -73,18 +73,34 @@ function TPHL_Internal.Ships_RenameAll(L, region)
         :: continue ::
     end
 
+    -- Sorted so the assignment of new names is stable across cycles. Which ship of a duplicate
+    -- pair ends up here is not -- the collection loop above uses `pairs`, so the first one seen
+    -- keeps the name -- but once the names are unique nothing is renamed again.
     table.sort(toBeRenamed);
 
     local c = utable.length(toBeRenamed);
-    for oid, _ in pairs(toBeRenamed) do
+    -- `ipairs`, not `pairs`: this is an ARRAY, so `pairs` binds the INDEX. Until 2026-08-23 this
+    -- read `for oid, _ in pairs(toBeRenamed)` and so renamed session game objects 1, 2, 3 ...
+    -- instead of the ships it had just collected. It never renamed a ship, and it threw out of
+    -- Loop the first time the list was non-empty, because object 1 carries no packed
+    -- destination. Issue #2.
+    for _, oid in ipairs(toBeRenamed) do
         while true do
             local newName = TradeExecutor.numberToBase62(c);
             if names[newName] == nil then
                 names[newName] = 1;
 
                 local info = TradeExecutor.Ship_Name_FetchCmdInfo(oid);
-                info.name = newName;
-                TradeExecutor.Ship_Name_StoreCmdInfo(oid, info);
+                if info.x ~= nil and info.y ~= nil and info.area_id ~= nil then
+                    -- Mid-voyage: the packed destination has to survive the rename.
+                    info.name = newName;
+                    TradeExecutor.Ship_Name_StoreCmdInfo(oid, info);
+                else
+                    -- A ship that has never been given a command carries a plain name and no
+                    -- coordinates -- which is most of what this function exists to rename.
+                    -- StoreCmdInfo would reject it, so set the name on its own.
+                    Anno.Ship_Name_Set(oid, newName);
+                end
 
                 L.logf("Renamed ship oid=%d to '%s' for trade route automation.", oid, newName);
                 break;
@@ -104,8 +120,11 @@ function TPHL_Internal.Ships_Available(L, region)
 
     local ships = Anno.Region_Ships_GetAll(region);
     if not ships then
+        -- Region is not current and nothing is cached. Empty tables, not nil: every caller
+        -- indexes all three straight away, and returning nil made the whole iteration throw
+        -- inside xpcall -- once per cycle, silently, with the mod looking alive.
         L.log("No ships found in region " .. region);
-        return nil, nil, nil;
+        return available, stillMoving, notEmpty;
     end
 
     for _, oid in pairs(ships) do
@@ -322,12 +341,14 @@ function tradeExecutor_iteration_state:activeTrades_Add(trade)
 
     local areaID_from = trade.command.Key.Order.AreaID_from;
     local areaID_to = trade.command.Key.Order.AreaID_to;
-    local goodID = trade.command.Key.Order.GoodID;
 
-    if areaID_from ~= nil then
-        self:areaTradeDirection_Set(areaID_from, goodID, AreaDirection_Out, trade.iteration);
+    -- A voyage may carry several goods; each one moves its own direction memory.
+    for _, g in ipairs(trade.command.Key.Order.Goods or {}) do
+        if areaID_from ~= nil then
+            self:areaTradeDirection_Set(areaID_from, g.GoodID, AreaDirection_Out, trade.iteration);
+        end
+        self:areaTradeDirection_Set(areaID_to, g.GoodID, AreaDirection_In, trade.iteration);
     end
-    self:areaTradeDirection_Set(areaID_to, goodID, AreaDirection_In, trade.iteration);
 end
 
 function tradeExecutor_iteration_state:activeTrades_Prune()
@@ -381,26 +402,73 @@ local function tradeExecutor_iteration(
         state:activeTrades_Add(t)
     end
 
-    local stock_inFlight = TradePlannerLL.Ships_StockInFlight(L, region, state.activeTrades);
-    local srt = TradePlannerLL.SupplyRequest_Build(L, region, stock_inFlight, areas, state);
-    local request_orders = TradePlannerLL.SupplyRequest_ToOrders(L, srt, areas);
-    local available_commands_kv = TradePlannerLL.SupplyRequestOrders_ToShipCommands(
-        L, areas, ships_available,
-        request_orders, state
-    );
-    local tasks = TradePlannerLL.SupplyRequestShipCommands_Execute(
-        L, region,
-        srt, available_commands_kv, ships_available
-    )
-    for _, t in ipairs(tasks) do
-        t.iteration = iteration;
-        state:activeTrades_Add(t)
+    --- Plan, dispatch and record one pass, and hand back what it spawned.
+    ---
+    --- `ships_available` is drawn down by Execute (`ships[ship] = nil`), so handing the SAME
+    --- table to a later pass is the whole of "run on the ships the earlier pass did not want".
+    ---
+    --- In-flight stock is recomputed per pass rather than hoisted out: by the time the hub pass
+    --- plans, the main pass has already added its dispatches to `state.activeTrades`, and a pass
+    --- that could not see them would offer the same supply twice and sail against a request that
+    --- is already met. That is issue #15 one pass later, and it is why this is inside the helper.
+    ---@param passL Logger
+    ---@param build fun(inFlight: TradePlanner.AreaGoodsInFlight): TradePlanner.SupplyRequestTable|nil
+    local function pass(passL, build)
+        local stock_inFlight = TradePlannerLL.Ships_StockInFlight(passL, region, state.activeTrades);
+
+        local srt = build(stock_inFlight);
+        if srt == nil then
+            return {}, nil;
+        end
+
+        local request_orders = TradePlannerLL.SupplyRequest_ToOrders(passL, srt, areas);
+        local available_commands_kv = TradePlannerLL.SupplyRequestOrders_ToShipCommands(
+            passL, areas, ships_available,
+            request_orders, state
+        );
+        local tasks = TradePlannerLL.SupplyRequestShipCommands_Execute(
+            passL, region,
+            srt, available_commands_kv, ships_available
+        )
+        for _, t in ipairs(tasks) do
+            t.iteration = iteration;
+            state:activeTrades_Add(t)
+        end
+
+        passL.logf("Spawned %d async tasks for trade route execution.", #tasks);
+        return tasks, srt;
     end
 
-    L.logf("Spawned %d async tasks for trade route execution.", #tasks);
+    local tasks, srt = pass(L, function(stock_inFlight)
+        return TradePlannerLL.SupplyRequest_Build(L, region, stock_inFlight, areas, state);
+    end);
+
+    -- Hubs get the ships the main pass did not want, and only those: filling a warehouse must
+    -- never compete with an island that is genuinely short. See docs/hubs.md.
+    --
+    -- Gated on a hub existing so that a region without one pays nothing at all. `Hubs` is a name
+    -- scan over `areas` -- no game queries -- whereas entering the pass costs a second
+    -- `Ships_StockInFlight`, which reads cargo and command info for every voyage in the air. The
+    -- recompute is not optional once we are in there: the main pass has already added its
+    -- dispatches to `state.activeTrades`, and the hub pass has to see them.
+    if next(TradePlannerLL.Hubs(areas)) ~= nil and utable.length(ships_available) > 0 then
+        local hubL = L.with("type", "hub");
+        local hubTasks = pass(hubL, function(stock_inFlight)
+            return TradePlannerLL.SupplyRequest_BuildHubs(hubL, region, stock_inFlight, areas, state);
+        end);
+        for _, t in ipairs(hubTasks) do
+            table.insert(tasks, t);
+        end
+    end
 
     local ships_available_after = utable.length(ships_available);
-    local requests_after = TPHL_Internal.RemainingSurplusDeficit(L, region, srt);
+
+    -- Main-pass deficit only. `SupplyRequest_Build` never returns nil, but `pass` is shared with
+    -- the hub build, which does, so the nil has to be handled to keep the signature honest.
+    local requests_after = 0;
+    if srt ~= nil then
+        requests_after = TPHL_Internal.RemainingSurplusDeficit(L, region, srt);
+    end
     if ships_available_after == 0 then
         L.log("No more available ships for trade routes automation.");
     elseif requests_after == 0 then
@@ -533,59 +601,3 @@ function TradePlannerHL.Loop(L, region, interrupt)
 end
 
 return TradePlannerHL;
-
-
---@param L Logger
---local function tradeExecutor_iteration_hub(
---        L,
---        areas,
---        region,
---
---        ships_inUse
---)
---
---    L.log("Attempting hub run with remaining available ships.");
---    L = L.with("type", "hub")
---
---    local ships_available_H, ships_stillMoving_H, _ = TradePlannerHL.__Internal.Ships_Available(L, region);
---    -- sometimes, 'is moving' does not reflect reality, so we filter ships again
---    for oid, _ in pairs(ships_inUse) do
---        ships_stillMoving_H[oid] = { route_name = "???" };
---        if ships_available_H[oid] ~= nil then
---            ships_available_H[oid] = nil;
---        end
---    end
---
---    if utable.length(ships_available_H) == 0 then
---        L.log("No available ships for trade routes automation, exiting iteration.");
---        return nil;
---    end
---
---    local stock_inFlight = TradePlannerLL.Ships_StockInFlight(L, region, ships_stillMoving_H)
---    local srt = TradePlannerLL.SupplyRequest_BuildHubs(L, region, stock_inFlight, areas);
---    if srt == nil then
---        L.log("No supply request table generated, exiting.");
---        return nil;
---    end
---    local rq = TradePlannerLL.SupplyRequest_ToOrders(L, srt, areas);
---    local acs = TradePlannerLL.SupplyRequestOrders_ToShipCommands(L, areas, ships_available_H, rq);
---    local tasks = TradePlannerLL.SupplyRequestShipCommands_Execute(
---            L, region,
---            srt, acs, ships_available_H
---    )
---    L.logf("Spawned %d async tasks for trade route execution.", #tasks);
---    return tasks;
---end
-
---local tasks_hub = nil;
---if ships_available_after > 0 then
---    for _ = 1, 10 do
---        coroutine.yield();
---    end
---    tasks_hub = tradeExecutor_iteration_hub(L, areas, region, ships_inUse);
---end
---if tasks_hub ~= nil then
---    for ship, task in pairs(tasks_hub) do
---        tasks[ship] = task;
---    end
---end

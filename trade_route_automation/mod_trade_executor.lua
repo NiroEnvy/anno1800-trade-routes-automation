@@ -149,25 +149,38 @@ local function dst_moveTo(
     )
 end
 
+--- Puts the WHOLE hold ashore at `areaID_dst` and empties it.
+---
+--- Every good aboard is credited, not just the one the voyage was ordered for. The old version
+--- credited a single good and then cleared every slot, which deleted anything else in the hold --
+--- harmless while a hull only ever carried one good, fatal the moment it carries several.
+---
+--- Whole-hold is also the only unload this can do: `Ship_Cargo_Clear` takes a real slot while the
+--- cargo vector is keyed by position, so leaving part of a load aboard would need a slot->position
+--- map nobody maintains (see the SHIP CARGO note in anno_interface.lua). Clearing every slot index
+--- never maps one onto the other, which is why it is safe.
+---
+---@return table<ProductGUID, Amount> unloaded per good
 local function dst_unload(
     region,
     ship_oid,
-    good_id,
     areaID_dst
 )
     local cargo = Anno.Ship_Cargo_Get(ship_oid)
-    local total_unloaded = 0
-    for i, cargo_item in pairs(cargo) do
-        if cargo_item.Guid == good_id then
+
+    local unloaded = {}
+    for _, cargo_item in pairs(cargo) do
+        if cargo_item.Value > 0 then
             Anno.Area_AddGood(region, areaID_dst, cargo_item.Guid, cargo_item.Value)
-            total_unloaded = total_unloaded + cargo_item.Value
+            unloaded[cargo_item.Guid] = (unloaded[cargo_item.Guid] or 0) + cargo_item.Value
         end
     end
+
     for i = 0, Anno.Ship_Cargo_SlotCapacity(ship_oid) + 1 do
         Anno.Ship_Cargo_Clear(ship_oid, i)
     end
 
-    return total_unloaded
+    return unloaded
 end
 
 TradeExecutor.Records = {};
@@ -176,42 +189,38 @@ TradeExecutor.Records = {};
     Executes a trade order with a ship asynchronously.
     Must be called from within an async task.
 
-    Command structure:
-    cmd = {
-        Key = {
-            ShipID = number,
-            Order = {
-                AreaID_from = number,
-                AreaID_to = number,
-                GoodID = number,
-                Amount = number
-            }
-        },
-        Value = {
-            FullSlotsNeeded = number,
-            OrderDistance = {
-                src = {x = number, y = number},
-                dst = {x = number, y = number},
-                dist = number
-            },
-            ShipDistance = number
-        }
-    }
+    See TradeExecutor.Command below for the command structure.
 
-    @param ship_oid number - Ship object ID
     @param cmd table - Command structure
 ]]
 
+--- One good on one voyage.
+---@class TradeExecutor.CommandGood
+---@field GoodID number
+---@field Amount number
+
+--- One voyage: a ship, one source, one destination, and everything it carries between them.
 ---@class TradeExecutor.Command
 ---@field AreaID_from number
 ---@field AreaID_to number
----@field GoodID number
----@field Amount number
+---@field Goods TradeExecutor.CommandGood[]
 ---@field Ship_ID number
 ---@field Ship_AmountPerSlot number
----@field FullSlotsNeeded number
 ---@field OrderDistance Distance
 ---@field ShipDistance number
+
+--- How many slots `goods` occupies. A good never shares a slot with another good, so a 30-unit
+--- leg costs a whole slot -- which is why the packing budget is slots and not units.
+---@param goods TradeExecutor.CommandGood[]
+---@param amount_per_slot number
+---@return number
+function TradeExecutor.SlotsNeeded(goods, amount_per_slot)
+    local slots = 0
+    for _, g in ipairs(goods) do
+        slots = slots + math.ceil(g.Amount / amount_per_slot)
+    end
+    return slots
+end
 
 ---@param L Logger
 ---@param region RegionID
@@ -221,22 +230,34 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
 
     local ship_oid = cmd.Ship_ID
     local amount_per_slot = cmd.Ship_AmountPerSlot
-    local order_key = cmd
     local order_distance = cmd.OrderDistance
-    local aSrc, aDst = order_key.AreaID_from, order_key.AreaID_to
+    local aSrc, aDst = cmd.AreaID_from, cmd.AreaID_to
+    local goods = cmd.Goods
 
     L = L.with("loc", "TradeExecutor._ExecuteTradeOrderWithShip");
 
     L.logf("start");
-    local aSrcGBefore = Anno.Area_GetGood(region, aSrc, order_key.GoodID)
-    local aDstGBefore = Anno.Area_GetGood(region, aDst, order_key.GoodID)
-    L.logf("before: source = %d, destination = %d", aSrcGBefore, aDstGBefore)
+
+    local slots_needed = TradeExecutor.SlotsNeeded(goods, amount_per_slot)
+    local slots_available = Anno.Ship_Cargo_SlotCapacity(ship_oid)
+    if slots_needed > slots_available then
+        -- The planner is meant to have fitted this. Refuse rather than load a hull past its
+        -- capacity, where the surplus would vanish silently at the load step.
+        error(string.format("Command needs %d slots but ship %d has %d", slots_needed, ship_oid, slots_available))
+    end
+
+    local srcBefore, dstBefore = {}, {}
+    for _, g in ipairs(goods) do
+        srcBefore[g.GoodID] = Anno.Area_GetGood(region, aSrc, g.GoodID)
+        dstBefore[g.GoodID] = Anno.Area_GetGood(region, aDst, g.GoodID)
+        L.logf("before: good=%d source = %d, destination = %d", g.GoodID, srcBefore[g.GoodID], dstBefore[g.GoodID])
+    end
 
     -- Step 1: Ensure ship cargo is empty
     TradeExecutor._ClearAllShipCargo(ship_oid)
 
     -- Step 2: Move ship to source area
-    L.logf("Moving ship %d to source area %d (x=%d, y=%d)", ship_oid, order_key.AreaID_from,
+    L.logf("Moving ship %d to source area %d (x=%d, y=%d)", ship_oid, aSrc,
         order_distance.src.x, order_distance.src.y)
     TradeExecutor.Ship_Name_StoreCmdInfo(ship_oid, {
         x = order_distance.src.x,
@@ -250,64 +271,83 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
     )
     L.logf("Ship %d arrived at source area", ship_oid)
 
-    -- Step 3: Load cargo at source
-    local slots_needed = math.ceil(order_key.Amount / amount_per_slot)
+    -- Step 3: Load cargo at source, one good at a time.
+    -- CheatItemInSlot picks the slot itself: it tops up a partial stack of the SAME good before
+    -- opening a new one, so a good loaded in one run of slots stays contiguous and never merges
+    -- with a different good.
+    local loaded = {}
     local total_loaded = 0
-    for i = 1, slots_needed do
-        local amount_to_load = math.min(amount_per_slot, order_key.Amount - total_loaded)
-        Anno.Ship_Cargo_Set(ship_oid, i, { Guid = order_key.GoodID, Value = amount_to_load })
-        Anno.Area_AddGood(region, aSrc, order_key.GoodID, -amount_to_load)
-        total_loaded = total_loaded + amount_to_load
+    for _, g in ipairs(goods) do
+        local good_loaded = 0
+        local good_slots = math.ceil(g.Amount / amount_per_slot)
+        for i = 1, good_slots do
+            local amount_to_load = math.min(amount_per_slot, g.Amount - good_loaded)
+            Anno.Ship_Cargo_Set(ship_oid, i, { Guid = g.GoodID, Value = amount_to_load })
+            Anno.Area_AddGood(region, aSrc, g.GoodID, -amount_to_load)
+            good_loaded = good_loaded + amount_to_load
+        end
+        loaded[g.GoodID] = (loaded[g.GoodID] or 0) + good_loaded
+        total_loaded = total_loaded + good_loaded
     end
 
     coroutine.yield();
     coroutine.yield();
 
-    local areaSrcGAfter = Anno.Area_GetGood(region, aSrc, order_key.GoodID);
+    local srcAfter = {}
+    for _, g in ipairs(goods) do
+        srcAfter[g.GoodID] = Anno.Area_GetGood(region, aSrc, g.GoodID);
+    end
 
-    L.logf("Loaded %d total units; area src: %d -> %d; moving to dst area (x=%d y=%d)",
-        total_loaded, aSrcGBefore, areaSrcGAfter, order_distance.dst.x, order_distance.dst.y)
+    L.logf("Loaded %d total units across %d good(s) in %d/%d slots; moving to dst area (x=%d y=%d)",
+        total_loaded, #goods, slots_needed, slots_available, order_distance.dst.x, order_distance.dst.y)
 
     -- Step 4: Move ship to destination area
     dst_moveTo(ship_oid, order_distance.dst, aDst)
     L.logf("Ship arrived at destination area")
 
-    -- Step 5: Unload cargo at destination
-    local total_unloaded = dst_unload(region, ship_oid, order_key.GoodID, aDst)
+    -- Step 5: Unload the whole hold at destination
+    local unloaded = dst_unload(region, ship_oid, aDst)
 
     coroutine.yield();
     coroutine.yield();
 
-    local aDstGAfter = Anno.Area_GetGood(region, aDst, order_key.GoodID)
-    L.logf("Trade order completed: unloaded=%d; src=(%d -> %d); dst=(%d -> %d)", total_unloaded, aSrcGBefore,
-        areaSrcGAfter, aDstGBefore, aDstGAfter)
+    local total_unloaded = 0
+    for _, amount in pairs(unloaded) do
+        total_unloaded = total_unloaded + amount
+    end
 
-    local area_src_n = Anno.Area_CityName(region, order_key.AreaID_from);
-    local area_dst_n = Anno.Area_CityName(region, order_key.AreaID_to);
+    local area_src_n = Anno.Area_CityName(region, aSrc);
+    local area_dst_n = Anno.Area_CityName(region, aDst);
     local ship_name = Anno.Ship_Name_Get(ship_oid);
-    local good_name = AnnoInfo.Product(order_key.GoodID).Name;
-
     local end_at = os.date("%Y-%m-%dT%H:%M:%SZ");
 
-    table.insert(TradeExecutor.Records, {
-        _start = start_at,
-        _end = end_at,
-        ship_oid = ship_oid,
-        ship_name = ship_name,
-        area_src = order_key.AreaID_from,
-        area_dst = order_key.AreaID_to,
-        area_src_name = area_src_n,
-        area_dst_name = area_dst_n,
-        good_id = order_key.GoodID,
-        good_name = good_name,
-        good_amount = order_key.Amount,
-        good_loaded = total_loaded,
-        good_unloaded = total_unloaded,
-        good_src_before = aSrcGBefore,
-        good_src_after = areaSrcGAfter,
-        good_dst_before = aDstGBefore,
-        good_dst_after = aDstGAfter
-    })
+    -- One record per good, so a packed voyage stays as readable in the log as a single-good one.
+    for _, g in ipairs(goods) do
+        local dstAfter = Anno.Area_GetGood(region, aDst, g.GoodID)
+        L.logf("Trade order completed: good=%d unloaded=%d; src=(%d -> %d); dst=(%d -> %d)",
+            g.GoodID, unloaded[g.GoodID] or 0, srcBefore[g.GoodID], srcAfter[g.GoodID],
+            dstBefore[g.GoodID], dstAfter)
+
+        table.insert(TradeExecutor.Records, {
+            _start = start_at,
+            _end = end_at,
+            ship_oid = ship_oid,
+            ship_name = ship_name,
+            area_src = aSrc,
+            area_dst = aDst,
+            area_src_name = area_src_n,
+            area_dst_name = area_dst_n,
+            good_id = g.GoodID,
+            good_name = AnnoInfo.Product(g.GoodID).Name,
+            good_amount = g.Amount,
+            good_loaded = loaded[g.GoodID] or 0,
+            good_unloaded = unloaded[g.GoodID] or 0,
+            good_src_before = srcBefore[g.GoodID],
+            good_src_after = srcAfter[g.GoodID],
+            good_dst_before = dstBefore[g.GoodID],
+            good_dst_after = dstAfter
+        })
+    end
 
     return {
         success = true,
@@ -325,28 +365,33 @@ end
 
 ---
 
+--- Sails a ship to `areaID_dst` and puts its whole hold ashore, whatever is in it.
 ---@param L Logger
 ---@param region RegionID
 ---@param ship_oid number
----@param good_id number
 ---@param areaID_dst number
 ---@param area_dst_coords Coordinate
 ---@return number - async task id
-function TradeExecutor._ExecuteUnloadWithShip(L, region, ship_oid, good_id, areaID_dst, area_dst_coords)
+function TradeExecutor._ExecuteUnloadWithShip(L, region, ship_oid, areaID_dst, area_dst_coords)
     return async.spawn(function()
         L.logf("Moving ship %d to unload at area %d (x=%d, y=%d)", ship_oid, areaID_dst, area_dst_coords.x,
             area_dst_coords.y)
         dst_moveTo(ship_oid, area_dst_coords, areaID_dst)
-        L.logf("Ship %d arrived at unload area %d, unloading good %d", ship_oid, areaID_dst, good_id)
+        L.logf("Ship %d arrived at unload area %d, unloading its hold", ship_oid, areaID_dst)
 
-        local areaDst_before = Anno.Area_GetGood(region, areaID_dst, good_id)
-        async.sleep(1)
-        local unloaded = dst_unload(region, ship_oid, good_id, areaID_dst);
-        async.sleep(1)
-        local areaDst_after = Anno.Area_GetGood(region, areaID_dst, good_id)
+        local before = {}
+        for _, item in pairs(Anno.Ship_Cargo_Get(ship_oid)) do
+            before[item.Guid] = Anno.Area_GetGood(region, areaID_dst, item.Guid)
+        end
 
-        L.logf("Unloaded %d units of good %d at area %d; area good before: %d, after: %d",
-            unloaded, good_id, areaID_dst, areaDst_before, areaDst_after)
+        async.sleep(1)
+        local unloaded = dst_unload(region, ship_oid, areaID_dst);
+        async.sleep(1)
+
+        for guid, amount in pairs(unloaded) do
+            L.logf("Unloaded %d units of good %d at area %d; area good before: %d, after: %d",
+                amount, guid, areaID_dst, before[guid] or 0, Anno.Area_GetGood(region, areaID_dst, guid))
+        end
     end)
 end
 

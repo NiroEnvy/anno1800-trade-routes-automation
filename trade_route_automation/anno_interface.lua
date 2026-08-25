@@ -1,6 +1,7 @@
 local serpLight = require("trade_route_automation/serp/lighttools");
 local objectAccessor = require("trade_route_automation/anno_object_accessor");
 local cache = require("trade_route_automation/utils_cache");
+local Regions = require("trade_route_automation/_regions");
 
 local Anno = {
     Internal = {},
@@ -168,16 +169,106 @@ end
 
 ---
 
+--[[
+    SHIP CARGO -- how the game actually behaves
+    ===========================================
+
+    Measured against a running game on 2026-08-22 (ship "O1", 6 slots). Not inferred, not assumed.
+    Every claim below is re-checkable with `make test/game`, which runs
+    tests/game/contract_cargo.lua against the live game and fails if any of it stops being true.
+
+    Read this before touching anything that loads or unloads a ship. Two of these cost half a day
+    each to find.
+
+    1. A CARGO VECTOR KEY IS NOT A SLOT NUMBER.
+
+       `Cargo Count` returns the number of STACKS ABOARD, not the number of slots -- 3 for three
+       goods on a six-slot ship. The vector is keyed 0..count-1 and RE-INDEXES when a stack is
+       removed, so the keys are positions in a dense list.
+
+       `ClearSlot(i)`, in contrast, addresses a REAL SLOT.
+
+       They agree only while the hold has no gaps. The run that settled it:
+
+           real slots [0]=Bricks [1]=Windows [2]=Beer   vector [0]=Bricks [1]=Windows [2]=Beer
+           ClearSlot(0)                              -> vector [0]=Windows [1]=Beer
+           ClearSlot(1)   -- vector[1] is Beer, real slot 1 is Windows
+                                                     -> vector [0]=Beer      ... Windows went
+
+       So this is WRONG, however natural it looks:
+
+           for i, item in pairs(Anno.Ship_Cargo_Get(oid)) do
+               Anno.Ship_Cargo_Clear(oid, i)          -- i is a position, not a slot
+           end
+
+       and this is right, because it never maps one onto the other:
+
+           for i = 0, Anno.Ship_Cargo_SlotCapacity(oid) + 1 do
+               Anno.Ship_Cargo_Clear(oid, i)
+           end
+
+       Practical consequence: unload a WHOLE hold, never part of one. Delivering some goods at one
+       island and the rest at another needs slot-level addressing, and slot-level addressing needs
+       a slot->position map nobody currently maintains.
+
+    2. A READ IN THE SAME FRAME AS A WRITE SEES THE OLD STATE.
+
+       Cheat commands land a frame or two later. mod_trade_executor.lua's `coroutine.yield()`s
+       after loading are load-bearing, not decoration -- drop them and the mod silently reads an
+       empty hold. (An experiment that omitted them concluded "loading does nothing at all".)
+
+    3. `CheatItemInSlot` PICKS THE SLOT ITSELF -- the `slot` argument below is ignored.
+
+       It fills the lowest free slot, and tops up an existing partial stack of the same good before
+       opening a new one: 30 + 30 of one good gives two stacks, 50 and 10, not two of 30.
+
+    4. UNITS ARE SYMMETRIC ACROSS THIS BOUNDARY.
+
+       `Ship_Cargo_Set` takes displayed units and halves them on the way in; `Ship_Cargo_Get`
+       returns displayed units. Write 50, read 50. Same for `Area_AddGood`. So callers can think
+       purely in displayed units -- which is what the planner and tests/lib/world.lua both do.
+
+    5. TWO DIFFERENT GOODS NEVER SHARE A SLOT.
+
+       Measured 2026-08-23, same ship. Loading 30 of one good and then 30 of another gives two
+       stacks of 30 -- not one slot holding 60:
+
+           Ship_Cargo_Set(Bricks, 30); Ship_Cargo_Set(Windows, 30)
+                                                     -> [0]=Bricks 30  [1]=Windows 30
+
+       and the sequence the executor actually runs for a packed voyage behaves the same way:
+
+           Bricks 50, Bricks 50, Windows 30          -> [0]=Bricks 50  [1]=Bricks 50  [2]=Windows 30
+
+       So a good's cost is `ceil(amount / 50)` SLOTS regardless of how full the last one is, and a
+       hold's budget is slots rather than units. mod_trade_planner_ll.lua packs on exactly this
+       basis: budget in units instead and a 6-slot ship carrying six 30-unit goods looks like it
+       still has room for another 120.
+
+       Pinned by the `packing:` tests in tests/game/contract_cargo.lua.
+
+    6. THE UNBALANCED PAREN IN Ship_Cargo_Clear IS TOLERATED.
+
+       It emits `ClearSlot(1))]`, one paren too many, and the parser accepts it. Left as-is
+       deliberately: it is the form that has been running in production, and "fixing" it is a
+       change with no upside and a real chance of a behaviour difference nobody would notice.
+       tests/game/contract_cargo.lua pins the current form as working.
+]]
+
 local type_Cargo = {
     Guid = "number",
     Value = "number"
 }
 
+--- Returns a DENSE vector of the stacks aboard, keyed 0..count-1. A key is a position, not a
+--- slot -- see note 1 above before passing one to Ship_Cargo_Clear.
 function Anno.Ship_Cargo_Get(oid)
     return serpLight.GetVectorGuidsFromSessionObject(
         '[MetaObjects SessionGameObject(' .. tostring(oid) .. ') ItemContainer Cargo Count]', type_Cargo);
 end
 
+--- `slot` is ignored: CheatItemInSlot picks the lowest free slot itself (note 3).
+--- `cargo.Value` is in displayed units (note 4).
 function Anno.Ship_Cargo_Set(oid, slot, cargo)
     if cargo.Value == 1 then
         cargo.Value = 2;
@@ -187,6 +278,8 @@ function Anno.Ship_Cargo_Set(oid, slot, cargo)
         ') ItemContainer CheatItemInSlot(' .. tostring(cargo.Guid) .. ',' .. tostring(cargo.Value / 2) .. ')]');
 end
 
+--- Empties REAL SLOT `slot` -- not a cargo-vector position (note 1).
+--- The extra `)` is deliberate; it works, and it is what production has always sent (note 6).
 function Anno.Ship_Cargo_Clear(oid, slot)
     return serpLight.DoForSessionGameObjectRaw('[MetaObjects SessionGameObject(' ..
         tostring(oid) .. ') ItemContainer ClearSlot(' .. tostring(slot) .. '))]');
@@ -267,31 +360,39 @@ end
 
 ---@alias RegionID string
 
----@type RegionID
-Anno.Region_OldWorld = "OW";
----@type RegionID
-Anno.Region_NewWorld = "NW";
----@type RegionID
-Anno.Region_Enbesa = "EN";
----@type RegionID
-Anno.Region_Arctic = "AR";
----@type RegionID
-Anno.Region_CapeTrelawney = "CT";
+-- `_regions.lua` owns which regions exist, their session GUIDs and their map bounds. These
+-- constants remain because call sites read better with a name than with "OW", but they are aliases
+-- into the registry now, not a second list to keep in sync.
 
----@type table<string, RegionID>
-local sessions = {
-    ["180023"] = Anno.Region_OldWorld,
-    ["180025"] = Anno.Region_NewWorld,
-    ["112132"] = Anno.Region_Enbesa,
-    ["180045"] = Anno.Region_Arctic,
-    ["110934"] = Anno.Region_CapeTrelawney,
-}
+---@type RegionID
+Anno.Region_OldWorld = Regions.OldWorld;
+---@type RegionID
+Anno.Region_NewWorld = Regions.NewWorld;
+---@type RegionID
+Anno.Region_Enbesa = Regions.Enbesa;
+---@type RegionID
+Anno.Region_Arctic = Regions.Arctic;
+---@type RegionID
+Anno.Region_CapeTrelawney = Regions.CapeTrelawney;
 
----@return RegionID
+---@return RegionID|nil  nil in a session the registry does not describe
 function Anno.Region_Current()
-    local _session = session.getSessionGUID();
-    local region = sessions[tostring(_session)];
-    return region;
+    local region = Regions.Current();
+    if region == nil then
+        return nil;
+    end
+    return region.code;
+end
+
+--- The regions the mod will actually drive -- those whose bounds have been measured. `_main.lua`
+--- spawns one planner thread per entry, so a region left without bounds costs nothing at runtime.
+---@return RegionID[]
+function Anno.Region_Enabled()
+    local ret = {};
+    for _, region in ipairs(Regions.Enabled()) do
+        table.insert(ret, region.code);
+    end
+    return ret;
 end
 
 ---

@@ -1,3 +1,17 @@
+--[[
+    Scratch-script executor, for testing small things against the running game.
+
+    No-op unless `lua/trade-automation/executor-enabled` exists, so it stays inert for anyone who
+    has not run `make install-script`. See docs/in-game-testing.md.
+
+    Required here rather than from _init.lua on purpose. The Shift+Alt+R hotkey runs
+    `trade_route_automation_restart()`, which is a closure from the _init.lua chunk already in
+    memory -- so its list of requires is fixed until _init.lua itself re-executes, and that only
+    happens on the SessionEnter trigger (assets.xml). _main.lua *is* re-required from disk by
+    package_requireAll on every restart, so putting it here means the hotkey is enough.
+]]
+require("trade_route_automation/_executor");
+
 local function getProfileName()
     return ts.Participants.Current.Profile.CompanyName;
 end
@@ -120,9 +134,17 @@ function M.theTradeRouteAutomation_threads(profileName, luaRoot)
 
     local asyncInterruptF = interrupt_on_file("trade_route_automation/stop-trade-route-async-watcher");
     local heartbeatInterruptF = interrupt_on_file("trade_route_automation/stop-trade-executor-heartbeat");
-    local tradeRouteLoopInterruptOwF = interrupt_on_file("trade_route_automation/stop-trade-route-loop-ow");
-    local tradeRouteLoopInterruptNwF = interrupt_on_file("trade_route_automation/stop-trade-route-loop-nw");
     local interruptF = interrupt_on_file("trade_route_automation/stop-trade-routes-automation-owner");
+
+    -- One planner thread per region the registry has bounds for; `_regions.lua` decides which those
+    -- are. The stop-file names are unchanged: `stop-trade-route-loop-ow`, `-nw`, and now `-en` and
+    -- friends for whatever else gets enabled.
+    local regions = Anno.Region_Enabled();
+    local regionInterruptFs = {};
+    for _, code in ipairs(regions) do
+        regionInterruptFs[code] = interrupt_on_file(
+            "trade_route_automation/stop-trade-route-loop-" .. string.lower(code));
+    end
 
     local interruptOnProfileNameChange = function()
         local b = getProfileName() == profileName;
@@ -170,21 +192,26 @@ function M.theTradeRouteAutomation_threads(profileName, luaRoot)
 
     local asyncInterrupt = _or(asyncInterruptF, interruptOnProfileNameChange, interruptOnFail, interruptOnDisable);
     local heartbeatInterrupt = _or(heartbeatInterruptF, interruptOnProfileNameChange, interruptOnFail, interruptOnDisable);
-    local tradeRouteLoopInterruptOW = _or(tradeRouteLoopInterruptOwF, interruptOnProfileNameChange, interruptOnFail,
-        interruptOnDisable);
-    local tradeRouteLoopInterruptNW = _or(tradeRouteLoopInterruptNwF, interruptOnProfileNameChange, interruptOnFail,
-        interruptOnDisable);
 
     local ts = {
         AnnoThread:new("trade-route-async-watcher",
             apply(async_watcher, L.with("loc", "async_watcher"), asyncInterrupt)),
         AnnoThread:new("trade-executor-alive-heartbeat",
             apply(heartbeat_loop, L.with("loc", "heartbeat_loop"), heartbeatInterrupt)),
-        AnnoThread:new("trade-route-executor-loop-ow",
-            apply(TradePlannerHL.Loop, L.with("loc", "Trade.Loop"), Anno.Region_OldWorld, tradeRouteLoopInterruptOW)),
-        AnnoThread:new("trade-route-executor-loop-nw",
-            apply(TradePlannerHL.Loop, L.with("loc", "Trade.Loop"), Anno.Region_NewWorld, tradeRouteLoopInterruptNW)),
     }
+
+    if #regions == 0 then
+        L.log("No regions are enabled -- every region in _regions.lua is missing its bounds.");
+    else
+        L.logf("Driving %d region(s): %s", #regions, table.concat(regions, ", "));
+    end
+
+    for _, code in ipairs(regions) do
+        local regionInterrupt = _or(regionInterruptFs[code], interruptOnProfileNameChange, interruptOnFail,
+            interruptOnDisable);
+        table.insert(ts, AnnoThread:new("trade-route-executor-loop-" .. string.lower(code),
+            apply(TradePlannerHL.Loop, L.with("loc", "Trade.Loop"), code, regionInterrupt)));
+    end
 
     while true do
         local anyFailed = false;

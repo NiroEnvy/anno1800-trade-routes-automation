@@ -74,11 +74,12 @@ function WaterPoints.Detect(
     step
 )
     local scan = cache.GetOrSetR(
-        function(_, _areaID, _step)
+        function(_region, _areaID, _step)
             local grid = areas[_areaID];
             local lx, ly = grid.min_x, grid.min_y;
             local hx, hy = grid.max_x, grid.max_y;
-            return map_scanner.Area_WaterPoints(L, lx, ly, hx, hy, _step);
+            -- the region picks the probe: Enbesa needs a second one, see ProbesFor in map_scanner
+            return map_scanner.Area_WaterPoints(L, lx, ly, hx, hy, _step, { region = _region });
         end,
         Area_WaterPoints_cacheKey, region, areaID, step
     );

@@ -48,7 +48,7 @@ function TrRAt_UI.AreaRescan.impl(step)
     local grid = areas[areaID];
     local lx, ly = grid.min_x, grid.min_y;
     local hx, hy = grid.max_x, grid.max_y;
-    local scan = MapScannerLL.Area_WaterPoints(TrRAt_UI.L, lx, ly, hx, hy, step);
+    local scan = MapScannerLL.Area_WaterPoints(TrRAt_UI.L, lx, ly, hx, hy, step, { region = region });
 
     cache.Set(
         "areaScanner_dfs",

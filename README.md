@@ -86,6 +86,10 @@ The mod uses ships that are assigned to a fake `TRA_${REGION_NAME}` trade route.
 | `TRA_EN`         | Enbesa (*)         |
 | `TRA_CT`         | Cape Trelawney (*) |
 
+Which regions the mod drives is decided by one table,
+[`trade_route_automation/_regions.lua`](trade_route_automation/_regions.lua) — including regions
+added by other mods. See [docs/regions.md](docs/regions.md).
+
 The trade route must be created manually, the ships should also be assigned to it manually.
 The ships MUST be in the relevant region, mod DOES NOT move ships between regions.
 
@@ -101,14 +105,28 @@ However, the mod automatically handles the above when it is restarted.
 NOTE: the mod stores ship assignments in the ship names. A name like 'k-7n-gd-2lA' is not a bug, but an encoded 4-tuple
 of ship short name, ship destination X and Y coordinates, and the destination area ID.
 
-(*) - islands not supported, but it should be relatively easy to add support.
+(*) - off by default: the region needs its map bounds measured once, by hand, because the game
+exposes no way to read them. Fill them into `_regions.lua` and the region turns on. The procedure is
+in [docs/regions.md](docs/regions.md).
 
 ### Hub cities
 
 If the mod has 'idle' ships (ships assigned to automation, but not currently executing any trade), it will try to
-send goods to hub cities (ones that have "(h)" in the end of their name).
+send goods to hub cities. Mark one by putting a suffix at the end of the island's name:
 
-The hub city will automatically request all goods from all other islands until 90% of its total capacity is used.
+- `(h)` — collect **every** good
+- `(hc)` — collect **construction goods only** (wood, timber, bricks, steel beams, windows,
+  reinforced concrete, elevators, steam motors, aluminium profiles) — useful for a city you are
+  actively building up
+
+A hub requests goods from the other islands until it holds 90% of its capacity. This runs as a
+second pass, *after* the normal trade loop and using only the ships that loop did not need, so
+filling a hub never delays an island that is genuinely short of something.
+
+Goods leave a hub through the normal trade loop, like any other island — so a hub in the middle of
+a region also works as a redistribution point.
+
+See [docs/hubs.md](docs/hubs.md) for the details and the measurements.
 
 ## Before/after mod when no in-region trade routes exist (except oil and mail)
 
@@ -131,6 +149,20 @@ dung/fertilizer.
 
 # Implementation details
 
+## Tests
+
+Two suites, described in [docs/testing-index.md](docs/testing-index.md):
+
+- `make test` — the planning and execution logic under plain `lua5.4` against a fake Anno 1800, no
+  game needed.
+- `make test/game` — the same assertions the fake rests on, re-checked against a **running game**,
+  so you find out when the fake drifts from reality.
+
+`make check` runs syntax, lint, typecheck and the unit suite together.
+
+For ad-hoc poking at real game APIs there is a file-drop hot-reload loop: `make run` and
+[docs/in-game-testing.md](docs/in-game-testing.md).
+
 ## List of "low-level" features
 
 - scanning
@@ -138,11 +170,18 @@ dung/fertilizer.
     - scan all detected islands to detect players' islands with approximate coast locations,
     - scan all players' ships and detect ships assigned to this mod (through a specific trade route name),
 - trading
-    - given a ship, a source and destination island, and a specific good, the mod can:
+    - given a ship, a source and destination island, and one or more goods, the mod can:
         - move the ship to the source island's pier,
-        - load the good from the source island to the ship,
+        - load the goods from the source island to the ship,
         - move the ship to the destination island's pier,
-        - unload the good at the destination island (fully)
+        - unload the whole hold at the destination island
+    - ships are packed: a voyage carries as many goods as will fit, provided they are all going
+      from the same island to the same island. A six-slot ship no longer sails with two slots used
+      because a single request only needed 100 units. Goods are only added to a hull if the
+      destination is genuinely short of them, so packing does not cause goods to be shipped back
+      and forth.
+        - the budget is cargo *slots*, not units: two different goods never share a slot, so 30
+          units of one good costs a whole slot just as 50 units would.
     - detect all islands' goods stock, requests, and total capacity,
         - requests are also automated, the mod checks island's buildings/residences and their consumptions (**),
         - new inputs from trade unions are detected, both old and new input goods are requested though,

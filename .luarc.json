@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "runtime.version": "Lua 5.4",
+  "runtime.path": [
+    "?.lua",
+    "?/init.lua"
+  ],
+  "workspace.ignoreDir": [
+    ".git",
+    "dist",
+    "docs",
+    "mods/dev/data",
+    "webapp",
+    "utils/memory-inspector",
+    "utils/oid-analyzer",
+    "utils/query-lookup",
+    "trade_route_automation/serp",
+    "trade_route_automation/rxi",
+    "trade_route_automation/iskolbin",
+    "old-log.lua",
+    "sample1.lua",
+    "tests/game"
+  ],
+  "workspace.library": [],
+  "diagnostics.globals": [
+    "ts",
+    "session",
+    "game",
+    "system",
+    "event",
+    "g_LTL_Serp",
+    "g_bint_Library051",
+    "TradeRouteAutomationThread",
+    "TRA_restart",
+    "tostring_quote",
+    "trade_route_automation_enable",
+    "trade_route_automation_disable",
+    "trade_route_automation_restart"
+  ],
+  "diagnostics.disable": [
+    "lowercase-global"
+  ],
+  "diagnostics.severity": {
+    "undefined-doc-name": "Warning",
+    "undefined-field": "Hint",
+    "missing-fields": "Hint"
+  },
+  "diagnostics.libraryFiles": "Disable"
+}

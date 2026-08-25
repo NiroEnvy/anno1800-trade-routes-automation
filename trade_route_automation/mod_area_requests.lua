@@ -70,21 +70,65 @@ function AreaRequests.Production(L, region)
     return ret;
 end
 
+--- The goods every island needs in order to BUILD, as opposed to to live or to produce. Module
+--- level because the `(hc)` hub marker means "bring construction goods here" and needs the same
+--- list -- see TradePlannerLL.Hubs.
+AreaRequests.ConstructionGoods = {
+    120008,  -- Wood
+    1010196, -- Timber
+    1010205, -- Bricks
+    1010218, -- Steel Beams
+    1010207, -- Windows
+    1010202, -- Reinforced Concrete
+    134623,  -- Elevator
+    1010224, -- Steam Motors
+    838,     -- Aluminium Profiles
+};
+
+--- What a particular region builds with ON TOP of the nine above. Enbesa's two building materials
+--- are useless anywhere else, so a region-wide list would have the Old World standing around
+--- asking for timber it cannot lay a brick with.
+---
+--- Additive rather than replacing, deliberately: Enbesa's higher tiers still want Steel Beams and
+--- Windows, and its harbour buildings still want Wood and Bricks. Dropping goods from an island's
+--- list stops deliveries that currently work, which is the worse way to be wrong -- asking for
+--- something an island rarely uses costs nothing, because no surplus means no voyage.
+local CONSTRUCTION_GOODS_EXTRA = {
+    [Anno.Region_Enbesa] = {
+        114356, -- Wanza Timber
+        114402, -- Mud Bricks
+    },
+};
+
+--- KNOWN GAP, scoped out rather than overlooked: `TradePlannerLL.Hubs` resolves the `(hc)` marker
+--- off `AreaRequests.ConstructionGoods` above and has no region in hand, so an `(hc)` hub in
+--- Enbesa collects the base nine and not these two. Only the base request path is region-aware.
+---@param region RegionID|nil  nil yields the base list, which is also what an unlisted region gets
+---@return ProductGUID[]
+function AreaRequests.ConstructionGoodsFor(region)
+    local extra = nil;
+    if region ~= nil then
+        extra = CONSTRUCTION_GOODS_EXTRA[region];
+    end
+    if extra == nil then
+        return AreaRequests.ConstructionGoods;
+    end
+
+    local ret = {};
+    for _, guid in ipairs(AreaRequests.ConstructionGoods) do
+        table.insert(ret, guid);
+    end
+    for _, guid in ipairs(extra) do
+        table.insert(ret, guid);
+    end
+    return ret;
+end
+
 function AreaRequests.Construction(L, region)
     local ret = {};
     local areas = Anno.Region_AreaID_To_OID(region);
 
-    local _constructionGoods = {
-        120008,  -- Wood
-        1010196, -- Timber
-        1010205, -- Bricks
-        1010218, -- Steel Beams
-        1010207, -- Windows
-        1010202, -- Reinforced Concrete
-        134623,  -- Elevator
-        1010224, -- Steam Motors
-        838,     -- Aluminium Profiles
-    };
+    local _constructionGoods = AreaRequests.ConstructionGoodsFor(region);
 
     for areaID, areaOID in pairs(areas) do
         areaID = tonumber(areaID);
