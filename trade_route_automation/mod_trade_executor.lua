@@ -416,13 +416,6 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
     }
 end
 
--- Helper: Clears all cargo from a ship
-function TradeExecutor._ClearAllShipCargo(ship_oid)
-    for i = 0, Anno.Ship_Cargo_SlotCapacity(ship_oid) + 1 do
-        Anno.Ship_Cargo_Clear(ship_oid, i)
-    end
-end
-
 ---
 
 --- Sails a ship to `areaID_dst` and puts its whole hold ashore, whatever is in it.

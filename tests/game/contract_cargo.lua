@@ -158,8 +158,8 @@ T.test("cargo: the mod's unbalanced ClearSlot string is accepted", function()
 end);
 
 T.test("cargo: clearing every slot index empties any hold", function()
-    -- This is what _ClearAllShipCargo does, and why it is correct: it never maps a vector
-    -- position onto a slot number.
+    -- The unload loop clears physical slots, never mapping a cargo-vector position
+    -- onto a slot number.
     local ship = G.ship();
     G.emptyHold(ship);
     G.load(ship, { BRICKS, WINDOWS, BEER });
@@ -314,7 +314,7 @@ T.test("packing: a mixed hold reads back whole, which is what the unload walks",
 end);
 
 T.test("packing: clearing every slot empties a mixed hold too", function()
-    -- _ClearAllShipCargo after a packed unload. Already proven for a hold with a gap; this is the
+    -- The unload loop is already proven for a hold with a gap; this is the
     -- same walk over a hold holding three different goods.
     local ship = G.ship();
     G.emptyHold(ship);
