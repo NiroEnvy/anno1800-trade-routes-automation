@@ -15,6 +15,10 @@ Notes:
 1. The mod currently handles trades INSIDE a single region. Cross-region trades are not handled. It does handle Old and New World regions separately.
 2. Mod works only in single player. Mod may misbehave on non-Normal difficulties (it relies a bit on game prices, I never tested on other difficulties).
 
+Ships keep their cargo if the destination no longer has room for the complete hold on arrival.
+The regular recovery pass can send that load to another island with space, even when every ship
+is carrying cargo. See [cargo transfer safety](docs/cargo-transfer-safety.md) for behavior and validation limits.
+
 ## Installation
 
 1. Install mod (https://github.com/kr3v/anno1800-trade-routes-automation/releases).

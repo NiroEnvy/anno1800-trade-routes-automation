@@ -28,6 +28,7 @@ tests/
   lib/goods.lua           real product GUIDs and names
   test_world.lua          the fake itself
   test_executor.lua       mod_trade_executor
+  test_transfer_safety.lua capacity/stock changes during voyages and exclusive ship ownership
   test_planner.lua        mod_trade_planner_ll
   test_in_flight.lua      Ships_StockInFlight
   test_force_unload.lua   Ships_ForceUnloadStoppedShips

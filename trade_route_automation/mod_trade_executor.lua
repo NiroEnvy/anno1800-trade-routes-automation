@@ -33,6 +33,31 @@ local AnnoInfo = require("trade_route_automation/generator/products");
 local alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 local SEPARATOR = "-";
 
+-- A task owns its ship even while queued, loading, or finishing with an empty
+-- hold. Movement/cargo alone cannot distinguish those states from idle.
+local busyShips = {};
+
+---@param ship_oid ShipID
+---@return boolean
+function TradeExecutor.Ship_IsBusy(ship_oid)
+    return busyShips[ship_oid] == true;
+end
+
+local function SpawnShipTask(L, ship_oid, execute)
+    if TradeExecutor.Ship_IsBusy(ship_oid) then
+        return nil;
+    end
+    busyShips[ship_oid] = true;
+    return async.spawn(function()
+        local success, result = xpcall(execute, debug.traceback);
+        busyShips[ship_oid] = nil;
+        if not success then
+            L.logf("[Error] executing cargo task for ship %d: %s", ship_oid, tostring(result));
+        end
+        return result;
+    end);
+end
+
 function TradeExecutor.numberToBase62(num)
     if num == 0 then
         return "0"
@@ -162,6 +187,7 @@ end
 ---
 ---@return table<ProductGUID, Amount> unloaded per good
 local function dst_unload(
+    L,
     region,
     ship_oid,
     areaID_dst
@@ -171,9 +197,26 @@ local function dst_unload(
     local unloaded = {}
     for _, cargo_item in pairs(cargo) do
         if cargo_item.Value > 0 then
-            Anno.Area_AddGood(region, areaID_dst, cargo_item.Guid, cargo_item.Value)
             unloaded[cargo_item.Guid] = (unloaded[cargo_item.Guid] or 0) + cargo_item.Value
         end
+    end
+
+    -- Check the complete hold against current per-good headroom BEFORE any
+    -- credit. Partial unloading cannot map dense cargo positions back to real
+    -- slots, and the destination may have filled during the voyage.
+    for guid, amount in pairs(unloaded) do
+        local capacity = Anno.Area_GetGoodCapacity(region, areaID_dst, guid);
+        assert(type(capacity) == "number" and capacity >= 0, "Cannot read destination capacity");
+        local available = capacity - Anno.Area_GetGood(region, areaID_dst, guid);
+        if available < amount then
+            L.logf("Unload deferred: area %d has room for %d of %d units of good %d; keeping the whole hold",
+                areaID_dst, available, amount, guid);
+            return {};
+        end
+    end
+
+    for guid, amount in pairs(unloaded) do
+        Anno.Area_AddGood(region, areaID_dst, guid, amount);
     end
 
     for i = 0, Anno.Ship_Cargo_SlotCapacity(ship_oid) + 1 do
@@ -253,8 +296,14 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
         L.logf("before: good=%d source = %d, destination = %d", g.GoodID, srcBefore[g.GoodID], dstBefore[g.GoodID])
     end
 
-    -- Step 1: Ensure ship cargo is empty
-    TradeExecutor._ClearAllShipCargo(ship_oid)
+    -- A stale assignment or a manually loaded ship must not discard real cargo.
+    -- Leave it for the ordinary whole-hold recovery path.
+    for _, item in pairs(Anno.Ship_Cargo_Get(ship_oid)) do
+        if item.Value > 0 then
+            L.logf("Trade order refused: ship %d already has cargo", ship_oid);
+            return { success = false, loaded = 0, unloaded = 0 };
+        end
+    end
 
     -- Step 2: Move ship to source area
     L.logf("Moving ship %d to source area %d (x=%d, y=%d)", ship_oid, aSrc,
@@ -281,13 +330,23 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
         local good_loaded = 0
         local good_slots = math.ceil(g.Amount / amount_per_slot)
         for i = 1, good_slots do
-            local amount_to_load = math.min(amount_per_slot, g.Amount - good_loaded)
+            local amount_to_load = math.min(amount_per_slot, g.Amount - good_loaded,
+                Anno.Area_GetGood(region, aSrc, g.GoodID))
+            -- The one-unit cargo cheat rounds up to two. Never invent that
+            -- extra unit when only one remains at the source.
+            if amount_to_load < 2 then
+                break;
+            end
             Anno.Ship_Cargo_Set(ship_oid, i, { Guid = g.GoodID, Value = amount_to_load })
             Anno.Area_AddGood(region, aSrc, g.GoodID, -amount_to_load)
             good_loaded = good_loaded + amount_to_load
         end
         loaded[g.GoodID] = (loaded[g.GoodID] or 0) + good_loaded
         total_loaded = total_loaded + good_loaded
+    end
+
+    if total_loaded == 0 then
+        return { success = false, loaded = 0, unloaded = 0 };
     end
 
     coroutine.yield();
@@ -306,7 +365,7 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
     L.logf("Ship arrived at destination area")
 
     -- Step 5: Unload the whole hold at destination
-    local unloaded = dst_unload(region, ship_oid, aDst)
+    local unloaded = dst_unload(L, region, ship_oid, aDst)
 
     coroutine.yield();
     coroutine.yield();
@@ -324,7 +383,8 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
     -- One record per good, so a packed voyage stays as readable in the log as a single-good one.
     for _, g in ipairs(goods) do
         local dstAfter = Anno.Area_GetGood(region, aDst, g.GoodID)
-        L.logf("Trade order completed: good=%d unloaded=%d; src=(%d -> %d); dst=(%d -> %d)",
+        L.logf("Trade order %s: good=%d unloaded=%d; src=(%d -> %d); dst=(%d -> %d)",
+            (unloaded[g.GoodID] or 0) == loaded[g.GoodID] and "completed" or "incomplete",
             g.GoodID, unloaded[g.GoodID] or 0, srcBefore[g.GoodID], srcAfter[g.GoodID],
             dstBefore[g.GoodID], dstAfter)
 
@@ -350,17 +410,10 @@ function TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
     end
 
     return {
-        success = true,
+        success = total_loaded == total_unloaded,
         loaded = total_loaded,
         unloaded = total_unloaded
     }
-end
-
--- Helper: Clears all cargo from a ship
-function TradeExecutor._ClearAllShipCargo(ship_oid)
-    for i = 0, Anno.Ship_Cargo_SlotCapacity(ship_oid) + 1 do
-        Anno.Ship_Cargo_Clear(ship_oid, i)
-    end
 end
 
 ---
@@ -371,9 +424,9 @@ end
 ---@param ship_oid number
 ---@param areaID_dst number
 ---@param area_dst_coords Coordinate
----@return number - async task id
+---@return number|nil async task id, or nil while another task owns the ship
 function TradeExecutor._ExecuteUnloadWithShip(L, region, ship_oid, areaID_dst, area_dst_coords)
-    return async.spawn(function()
+    return SpawnShipTask(L, ship_oid, function()
         L.logf("Moving ship %d to unload at area %d (x=%d, y=%d)", ship_oid, areaID_dst, area_dst_coords.x,
             area_dst_coords.y)
         dst_moveTo(ship_oid, area_dst_coords, areaID_dst)
@@ -385,7 +438,7 @@ function TradeExecutor._ExecuteUnloadWithShip(L, region, ship_oid, areaID_dst, a
         end
 
         async.sleep(1)
-        local unloaded = dst_unload(region, ship_oid, areaID_dst);
+        local unloaded = dst_unload(L, region, ship_oid, areaID_dst);
         async.sleep(1)
 
         for guid, amount in pairs(unloaded) do
@@ -400,18 +453,11 @@ end
 ---@param L Logger
 ---@param region RegionID
 ---@param cmd TradeExecutor.Command
+---@return number|nil async task id, or nil while another task owns the ship
 function TradeExecutor.SpawnTradeOrder(L, region, cmd)
-    return async.spawn(function()
-        local success, result = xpcall(function()
-            return TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd)
-        end, debug.traceback)
-
-        if not success then
-            L.logf("[Error] executing trade order for ship %d: %s", cmd.Ship_ID, tostring(result))
-        end
-
-        return result
-    end)
+    return SpawnShipTask(L, cmd.Ship_ID, function()
+        return TradeExecutor._ExecuteTradeOrderWithShip(L, region, cmd);
+    end);
 end
 
 function TradeExecutor.ExecuteMultipleOrders(L, region, orders)

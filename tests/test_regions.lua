@@ -49,11 +49,11 @@ T.test("regions: only regions with bounds are enabled", function()
     for _, r in ipairs(R.Enabled()) do
         table.insert(codes, r.code);
     end
-    T.deep_eq(codes, { "OW", "NW" }, "enabled out of the box");
+    T.deep_eq(codes, { "OW", "NW", "EN", "AR" }, "enabled out of the box");
 
-    T.nil_(R.Bounds("EN"), "Enbesa has no bounds until someone measures them");
-    T.nil_(R.Bounds("AR"), "the Arctic likewise");
-    T.nil_(R.Bounds("CT"), "Cape Trelawney likewise");
+    T.deep_eq(R.Bounds("EN"), { x0 = 250, y0 = 250, x1 = 2000, y1 = 2000 }, "Enbesa ships with bounds");
+    T.deep_eq(R.Bounds("AR"), { x0 = 250, y0 = 250, x1 = 2000, y1 = 2000 }, "the Arctic ships with bounds");
+    T.nil_(R.Bounds("CT"), "Cape Trelawney has no bounds yet");
 end);
 
 T.test("regions: OW and NW bounds are what the scanner used to hardcode", function()
@@ -69,8 +69,8 @@ T.test("regions: the current session resolves through the GUID", function()
     inSession(180023, function()
         T.eq(R.Current().code, "OW", "session 180023");
     end);
-    inSession(112132, function()
-        T.eq(R.Current().code, "EN", "session 112132, registered but not enabled");
+    inSession(110934, function()
+        T.eq(R.Current().code, "CT", "session 110934, registered but not enabled");
     end);
     inSession(999999, function()
         T.nil_(R.Current(), "a session no row describes");
@@ -81,14 +81,14 @@ end);
 T.test("regions: supplying bounds is all it takes to enable a region", function()
     local R = fresh();
 
-    R.Register { guid = "112132", code = "EN", name = "Enbesa",
+    R.Register { guid = "110934", code = "CT", name = "Cape Trelawney",
         bounds = { x0 = 250, y0 = 250, x1 = 2000, y1 = 2000 } };
 
     local codes = {};
     for _, r in ipairs(R.Enabled()) do
         table.insert(codes, r.code);
     end
-    T.deep_eq(codes, { "OW", "NW", "EN" }, "Enbesa joins, keeping its declared slot");
+    T.deep_eq(codes, { "OW", "NW", "EN", "AR", "CT" }, "Cape Trelawney joins, keeping its declared slot");
     T.len(R.All(), 5, "and overrode its row rather than adding a second one");
 end);
 

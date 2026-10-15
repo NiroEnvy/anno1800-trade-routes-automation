@@ -16,6 +16,7 @@ local files = {
     "tests/test_construction_goods",
     "tests/test_world",
     "tests/test_executor",
+    "tests/test_transfer_safety",
     "tests/test_planner",
     "tests/test_in_flight",
     "tests/test_force_unload",

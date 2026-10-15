@@ -162,7 +162,7 @@ T.test("executor: the ship name tracks where the ship is headed", function()
     T.eq(info.x, 900, "and at its coordinates");
 end);
 
-T.test("executor: cargo already aboard is thrown away before loading", function()
+T.test("executor: a normal order preserves cargo already aboard", function()
     local h = Harness.new(world());
 
     h.world:load(900, G.Windows, 100);
@@ -171,7 +171,10 @@ T.test("executor: cargo already aboard is thrown away before loading", function(
     h.TradeExecutor.SpawnTradeOrder(h.L, "OW", command(G.Bricks, 150));
     h:run();
 
-    T.eq(h.world:total(G.Windows), before - 100, "step 1 clears the hold, goods and all");
+    T.eq(h.world:total(G.Windows), before, "existing windows are conserved");
+    T.deep_eq(h.world:cargo(900), { [G.Windows] = 100 }, "existing hold remains aboard");
+    T.eq(h.world:stock(10, G.Bricks), 600, "nothing loaded at the source");
+    T.len(h.TradeExecutor.Records, 0, "no completed trade");
 end);
 
 ---
@@ -278,19 +281,20 @@ T.test("executor: the cargo vector is dense, so its keys are not slot numbers", 
     T.eq(cargo[1].Guid, G.Beer, "Beer is at position 1 while sitting in real slot 2");
 end);
 
-T.test("executor: a voyage unloads a hold that has a gap in it", function()
-    -- _ClearAllShipCargo walks every slot index rather than trusting the cargo vector's keys,
-    -- which is exactly why a gap does not trip it up.
+T.test("executor: a normal order preserves an occupied hold with a gap", function()
     local h = Harness.new(world());
 
     h.world:load(900, G.Windows, 50);
     h.world:load(900, G.Beer, 50);
     h.world:clearSlot(900, 0);   -- Beer now sits alone in real slot 1
+    local before = h.world:total(G.Beer);
 
     h.TradeExecutor.SpawnTradeOrder(h.L, "OW", command(G.Bricks, 150));
     h:run();
 
     T.deep_eq(h:taskErrors(), {}, "no errors");
-    T.deep_eq(h.world:cargo(900), {}, "hold emptied");
-    T.eq(h.world:stock(20, G.Bricks), 200, "150 delivered");
+    T.deep_eq(h.world:cargo(900), { [G.Beer] = 50 }, "gapped cargo is retained");
+    T.eq(h.world:total(G.Beer), before, "beer is conserved");
+    T.eq(h.world:stock(10, G.Bricks), 600, "source is untouched");
+    T.eq(h.world:stock(20, G.Bricks), 50, "destination is untouched");
 end);

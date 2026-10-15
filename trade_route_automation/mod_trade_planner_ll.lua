@@ -916,6 +916,15 @@ function TradePlannerLL.SupplyRequestShipCommands_Execute(
         Lt.logf("Spawning trade order");
 
         local task_id = TradeExecutor.SpawnTradeOrder(Lt, region, cmd)
+        if task_id == nil then
+            for _, g in ipairs(accepted) do
+                supplyRequestTable.Supply[order.AreaID_from][g.GoodID] =
+                    supplyRequestTable.Supply[order.AreaID_from][g.GoodID] + g.Amount;
+                supplyRequestTable.Request[order.AreaID_to][g.GoodID] =
+                    supplyRequestTable.Request[order.AreaID_to][g.GoodID] + g.Amount;
+            end
+            goto continue;
+        end
         table.insert(spawned_tasks, {
             coroutineID = task_id,
             command = kv,
@@ -932,20 +941,31 @@ end
 ---@param region RegionID
 ---@param areas table<AreaID, AreaData>
 ---@param toUnload table<ShipID, any>
+---@param activeTrades? ActiveTrades
 ---@return ActiveTrades
 function TradePlannerLL.Ships_ForceUnloadStoppedShips(
     L,
     region,
     areas,
-    toUnload
+    toUnload,
+    activeTrades
 )
     local trades = {};
 
     -- Space promised to earlier ships in this same pass, so two stuck ships are not both sent to
     -- the one island with room for exactly one of them. areaID -> goodID -> amount.
     local reserved = {};
+    for areaID, goods in pairs(TradePlannerLL.Ships_StockInFlight(L, region, activeTrades or {})) do
+        reserved[areaID] = {};
+        for guid, amounts in pairs(goods) do
+            reserved[areaID][guid] = amounts.In;
+        end
+    end
 
     for ship, _ in pairs(toUnload) do
+        if TradeExecutor.Ship_IsBusy(ship) then
+            goto continue;
+        end
         L.logf("Ship %d has cargo, waiting for it to unload before starting automation.", ship);
 
         -- Total up the hold per good. A packed ship carries several, and the unload puts the
@@ -980,13 +1000,16 @@ function TradePlannerLL.Ships_ForceUnloadStoppedShips(
                 goto continueA;
             end
 
-            local capacity = areaData.capacity;
             local headroom = math.huge;
 
             for _, guid in ipairs(goods) do
+                local capacity = Anno.Area_GetGoodCapacity(region, areaID, guid);
+                if type(capacity) ~= "number" or capacity < 0 then
+                    goto continueA;
+                end
                 local taken = Anno.Area_GetGood(region, areaID, guid) + ((reserved[areaID] or {})[guid] or 0);
                 local availableCap = capacity - taken;
-                if availableCap <= AMOUNT_PER_SLOT or availableCap < byGood[guid] then
+                if availableCap < byGood[guid] then
                     goto continueA;
                 end
                 headroom = math.min(headroom, availableCap);
@@ -1070,6 +1093,9 @@ function TradePlannerLL.Ships_ForceUnloadStoppedShips(
             trade.areaID_dst,
             trade.area_dst_coords
         );
+        if task_id == nil then
+            goto continueTrade;
+        end
 
         table.insert(spawned_tasks, {
             coroutineID = task_id,
@@ -1094,6 +1120,7 @@ function TradePlannerLL.Ships_ForceUnloadStoppedShips(
                 }
             }
         })
+        :: continueTrade ::
     end
 
     return spawned_tasks;

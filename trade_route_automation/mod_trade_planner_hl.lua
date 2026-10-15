@@ -141,7 +141,7 @@ function TPHL_Internal.Ships_Available(L, region)
                 end
             end
 
-            if isMoving then
+            if isMoving or TradeExecutor.Ship_IsBusy(oid) then
                 stillMoving[oid] = { route_name = route_name };
                 L.logf("trade route automation ship -> stillMoving : oid=%d name=%s route=%s isMoving=%s hasCargo=%s",
                     oid, tostring(objectAccessor.GameObject(oid).Nameable.Name), tostring(route_name), tostring(isMoving),
@@ -391,15 +391,16 @@ local function tradeExecutor_iteration(
             ships_withCargo_notMoving[shipOID] = nil;
         end
     end
-    if utable.length(ships_available) == 0 then
-        L.log("No available ships for trade routes automation, exiting iteration.");
-        return nil, iteration;
-    end
-
-    local unloadTasks = TradePlannerLL.Ships_ForceUnloadStoppedShips(L, region, areas, ships_withCargo_notMoving);
+    local unloadTasks = TradePlannerLL.Ships_ForceUnloadStoppedShips(
+        L, region, areas, ships_withCargo_notMoving, state.activeTrades);
     for _, t in ipairs(unloadTasks) do
         t.iteration = iteration;
         state:activeTrades_Add(t)
+    end
+
+    if utable.length(ships_available) == 0 then
+        L.log("No available ships for trade routes automation, exiting iteration.");
+        return unloadTasks, iteration;
     end
 
     --- Plan, dispatch and record one pass, and hand back what it spawned.
